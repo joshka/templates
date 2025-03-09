@@ -1,29 +1,19 @@
+use color_eyre::eyre::WrapErr;
 use ratatui::crossterm::event::{self, Event as CrosstermEvent};
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
-
-/// Application events.
-///
-/// You can extend this enum with your own custom events.
-#[derive(Clone, Debug)]
-pub enum AppEvent {
-    /// Custom increment event.
-    Increment,
-    /// Custom decrement event.
-    Decrement,
-    /// Quit the application.
-    Quit,
-}
+use std::{
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 
 /// Representation of all possible events.
 #[derive(Clone, Debug)]
 pub enum Event {
     /// An event that is emitted on a regular schedule.
     ///
-    /// Use this event to run any code which has to run outside of being a direct response to
-    /// a user event. e.g. polling exernal systems, updating animations, or rendering the UI
-    /// based on a fixed frame rate.
+    /// Use this event to run any code which has to run outside of being a direct response to a user
+    /// event. e.g. polling exernal systems, updating animations, or rendering the UI based on a
+    /// fixed frame rate.
     Tick,
     /// Crossterm events.
     ///
@@ -35,6 +25,19 @@ pub enum Event {
     App(AppEvent),
 }
 
+/// Application events.
+///
+/// You can extend this enum with your own custom events.
+#[derive(Clone, Debug)]
+pub enum AppEvent {
+    /// Increment the counter.
+    Increment,
+    /// Decrement the counter.
+    Decrement,
+    /// Quit the application.
+    Quit,
+}
+
 /// Terminal event handler.
 #[derive(Debug)]
 pub struct EventHandler {
@@ -44,47 +47,79 @@ pub struct EventHandler {
     receiver: mpsc::Receiver<Event>,
 }
 
+/// A thread that handles reading crossterm events and emitting tick events on a regular schedule.
+struct EventThread {
+    /// Event sender channel.
+    sender: mpsc::Sender<Event>,
+}
+
+/// The frequency at which tick events are emitted.
+const TICK_FPS: f64 = 30.0;
+
 impl EventHandler {
-    /// Constructs a new instance of [`EventHandler`].
+    /// Constructs a new instance of [`EventHandler`] and spawns a new thread to handle events.
     pub fn new() -> Self {
-        let tick_rate = Duration::from_secs_f32(1.0 / 30.0);
         let (sender, receiver) = mpsc::channel();
-        let sender_cloned = sender.clone();
-        thread::spawn(move || {
-            let mut last_tick = Instant::now();
-            loop {
-                let timeout = tick_rate
-                    .checked_sub(last_tick.elapsed())
-                    .unwrap_or(tick_rate);
-
-                if event::poll(timeout).expect("failed to poll new events") {
-                    let event = event::read().expect("unable to read event");
-                    let _ = sender.send(Event::Crossterm(event));
-                }
-
-                if last_tick.elapsed() >= tick_rate {
-                    let _ = sender.send(Event::Tick);
-                    last_tick = Instant::now();
-                }
-            }
-        });
-        Self {
-            sender: sender_cloned,
-            receiver,
-        }
+        let actor = EventThread::new(sender.clone());
+        thread::spawn(|| actor.run());
+        Self { sender, receiver }
     }
 
     /// Receives an event from the sender.
-    pub fn receive(&self) -> color_eyre::Result<Event> {
+    ///
+    /// This function blocks until an event is received.
+    ///
+    /// # Errors
+    ///
+    /// This function returns an error if the sender channel is disconnected. This can happen if an
+    /// error occurs in the event thread. In practice, this should not happen unless there is a
+    /// problem with the underlying terminal.
+    pub fn next(&self) -> color_eyre::Result<Event> {
         Ok(self.receiver.recv()?)
     }
 
+    /// Queue an app event to be sent to the event receiver.
+    ///
+    /// This is useful for sending events to the event handler which will be processed by the next
+    /// iteration of the application's event loop.
+    pub fn send(&mut self, app_event: AppEvent) {
+        // ignore the result as the reciever cannot be dropped while this struct still has a
+        // reference to it
+        let _ = self.sender.send(Event::App(app_event));
+    }
+}
+
+impl EventThread {
+    /// Constructs a new instance of [`EventThread`].
+    fn new(sender: mpsc::Sender<Event>) -> Self {
+        Self { sender }
+    }
+
+    /// Runs the event thread.
+    ///
+    /// This function emits tick events at a fixed rate and polls for crossterm events in between.
+    fn run(self) -> color_eyre::Result<()> {
+        let tick_interval = Duration::from_secs_f64(1.0 / TICK_FPS);
+        let mut last_tick = Instant::now();
+        loop {
+            // emit tick events at a fixed rate
+            let timeout = tick_interval.saturating_sub(last_tick.elapsed());
+            if timeout == Duration::ZERO {
+                last_tick = Instant::now();
+                self.send(Event::Tick);
+            }
+            // poll for crossterm events, ensuring that we don't block the tick interval
+            if event::poll(timeout).wrap_err("failed to poll for crossterm events")? {
+                let event = event::read().wrap_err("failed to read crossterm event")?;
+                self.send(Event::Crossterm(event));
+            }
+        }
+    }
+
     /// Sends an event to the receiver.
-    pub fn send(&self, event: Event) {
-        // The result is ignored because the receiver may have been dropped when the app is
-        // shutting down.
-        //
-        // This is expected behavior and should not panic.
+    fn send(&self, event: Event) {
+        // ignore the result because shutting down the app drops the receiver, which causes the send
+        // operation to fail. This is expected behavior and should not panic.
         let _ = self.sender.send(event);
     }
 }
